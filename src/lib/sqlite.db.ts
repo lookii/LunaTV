@@ -1,7 +1,6 @@
 /* eslint-disable no-console */
 import { createHash } from 'crypto';
 import fs from 'fs';
-import { DatabaseSync } from 'node:sqlite';
 import path from 'path';
 
 import { AdminConfig } from './admin.types';
@@ -21,32 +20,225 @@ import {
 const SEARCH_HISTORY_LIMIT = 20;
 const CACHE_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 60 分钟
 
+// ==================== 数据库适配器（自动选择 node:sqlite 或 sql.js） ====================
+
+interface PreparedStatement {
+  get(...params: unknown[]): Record<string, unknown> | undefined;
+  all(...params: unknown[]): Record<string, unknown>[];
+  run(...params: unknown[]): void;
+}
+
+interface DatabaseLike {
+  exec(sql: string): void;
+  prepare(sql: string): PreparedStatement;
+  close(): void;
+}
+
+/**
+ * 同步适配器 — 使用 Node.js 内置 node:sqlite（DatabaseSync）
+ * 要求 Node.js >= 22.5
+ */
+class NativeSqliteAdapter implements DatabaseLike {
+  private db: InstanceType<typeof import('node:sqlite').DatabaseSync>;
+
+  constructor(filePath: string) {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
+    this.db = new DatabaseSync(filePath);
+  }
+
+  exec(sql: string): void {
+    this.db.exec(sql);
+  }
+
+prepare(sql: string): PreparedStatement {
+  const stmt = this.db.prepare(sql);
+  return {
+    get: (...params: unknown[]) =>
+      stmt.get(
+        ...(params as import('node:sqlite').SQLInputValue[]),
+      ) as Record<string, unknown> | undefined,
+    all: (...params: unknown[]) =>
+      stmt.all(
+        ...(params as import('node:sqlite').SQLInputValue[]),
+      ) as Record<string, unknown>[],
+    run: (...params: unknown[]) => {
+      stmt.run(...(params as import('node:sqlite').SQLInputValue[]));
+    },
+  };
+}
+
+  close(): void {
+    this.db.close();
+  }
+}
+
+/**
+ * 内存适配器 — 使用纯 JS 的 sql.js（自动回退）
+ * 无原生依赖，兼容所有 Node.js 版本
+ * 注意：数据存在内存中，通过 saveToFile() 定期写入磁盘
+ */
+class SqlJsAdapter implements DatabaseLike {
+  private db: import('sql.js').Database;
+  private dbPath: string | null;
+
+  constructor(db: import('sql.js').Database, dbPath: string | null) {
+    this.db = db;
+    this.dbPath = dbPath;
+  }
+
+  /** 创建适配器实例（异步，需要加载 WASM） */
+  static async create(dbPath: string | null): Promise<SqlJsAdapter> {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const initSqlJs = require('sql.js') as typeof import('sql.js').default;
+    const SQL = await initSqlJs();
+
+    let db: import('sql.js').Database;
+    if (dbPath && fs.existsSync(dbPath)) {
+      const buffer = fs.readFileSync(dbPath);
+      db = new SQL.Database(buffer);
+    } else {
+      db = new SQL.Database();
+    }
+
+    return new SqlJsAdapter(db, dbPath);
+  }
+
+  exec(sql: string): void {
+    this.db.exec(sql);
+  }
+
+  prepare(sql: string): PreparedStatement {
+    return {
+      get: (...params: unknown[]) => {
+        const stmt = this.db.prepare(sql);
+        if (params.length > 0) stmt.bind(params as import('sql.js').BindParams);
+        let result: Record<string, unknown> | undefined;
+        if (stmt.step()) result = stmt.getAsObject();
+        stmt.free();
+        return result;
+      },
+      all: (...params: unknown[]) => {
+        const stmt = this.db.prepare(sql);
+        if (params.length > 0) stmt.bind(params as import('sql.js').BindParams);
+        const results: Record<string, unknown>[] = [];
+        while (stmt.step()) results.push(stmt.getAsObject());
+        stmt.free();
+        return results;
+      },
+      run: (...params: unknown[]) => {
+        this.db.run(sql, params as import('sql.js').BindParams);
+      },
+    };
+  }
+
+  close(): void {
+    this.save();
+    this.db.close();
+  }
+
+  /** 将内存数据库持久化到磁盘 */
+  save(): void {
+    if (!this.dbPath) return;
+    try {
+      const dbDir = path.dirname(this.dbPath);
+      if (!fs.existsSync(dbDir)) {
+        fs.mkdirSync(dbDir, { recursive: true });
+      }
+      const data = this.db.export();
+      fs.writeFileSync(this.dbPath, Buffer.from(data));
+    } catch (err) {
+      console.error('[SQLite] 保存数据库失败:', err);
+    }
+  }
+
+  getEngine(): string {
+    return 'sql.js';
+  }
+}
+
+// ==================== 数据库初始化（自动选择引擎） ====================
+
+/**
+ * 尝试使用 node:sqlite，失败则回退到 sql.js
+ * @returns [DatabaseLike, engineName]
+ */
+async function openDatabase(
+  dbPath: string | null,
+): Promise<[DatabaseLike, string]> {
+  try {
+    // 1. 尝试加载 node:sqlite（需要 Node.js >= 22.5）
+    require('node:sqlite');
+    if (dbPath) {
+      const dbDir = path.dirname(dbPath);
+      if (!fs.existsSync(dbDir)) {
+        fs.mkdirSync(dbDir, { recursive: true });
+      }
+      console.log(`[SQLite] 使用 node:sqlite 引擎，数据库: ${dbPath}`);
+      return [new NativeSqliteAdapter(dbPath), 'node:sqlite'];
+    } else {
+      console.log('[SQLite] 使用 node:sqlite 引擎（内存模式）');
+      return [new NativeSqliteAdapter(':memory:'), 'node:sqlite'];
+    }
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException;
+    if (
+      err.code === 'ERR_UNKNOWN_BUILTIN_MODULE' ||
+      err.code === 'MODULE_NOT_FOUND'
+    ) {
+      // 2. 回退到 sql.js
+      console.warn(
+        '[SQLite] node:sqlite 不可用，回退到 sql.js（纯 JS 引擎）',
+      );
+      const adapter = await SqlJsAdapter.create(dbPath);
+      console.log(`[SQLite] 使用 sql.js 引擎，数据库: ${dbPath || ':memory:'}`);
+      return [adapter, 'sql.js'];
+    }
+    throw e; // 其他错误不捕获
+  }
+}
+
+// ==================== 主存储类 ====================
+
 export class SqliteStorage implements IStorage {
-  private db!: DatabaseSync;
+  private db!: DatabaseLike;
+  private engine!: string;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
+  private ready: Promise<void>;
 
   constructor() {
     const isBuild = process.env.IS_BUILD_PHASE === 'true';
 
     if (isBuild) {
-      this.db = new DatabaseSync(':memory:');
-      this.initTables();
+      this.ready = this.initBuild();
       return;
     }
 
     const dbPath =
       process.env.SQLITE_DB_PATH ||
       path.join(process.cwd(), 'data', 'lunatv.db');
-    const dbDir = path.dirname(dbPath);
 
-    // 自动创建数据库目录
-    if (!fs.existsSync(dbDir)) {
-      fs.mkdirSync(dbDir, { recursive: true });
-    }
+    this.ready = this.initRuntime(dbPath);
 
+    // 进程退出时关闭数据库
+    process.once('exit', () => this.close());
+  }
+
+  // ==================== 初始化 ====================
+
+  private async initBuild(): Promise<void> {
+    const [db] = await openDatabase(null);
+    this.db = db;
+    this.engine = 'build';
+    this.initTables();
+  }
+
+  private async initRuntime(dbPath: string): Promise<void> {
     console.log(`[SQLite] 正在打开数据库: ${dbPath}`);
     try {
-      this.db = new DatabaseSync(dbPath);
+      const [db, engine] = await openDatabase(dbPath);
+      this.db = db;
+      this.engine = engine;
 
       // WAL 模式 — 提升并发读性能
       this.db.exec('PRAGMA journal_mode = WAL');
@@ -54,18 +246,28 @@ export class SqliteStorage implements IStorage {
       this.initTables();
 
       // 定时清理过期缓存
+      // 如果是 sql.js 引擎，清理后同时持久化到磁盘
       this.cleanupTimer = setInterval(() => {
         this.clearExpiredCache().catch((err) => {
           console.error('[SQLite] 缓存清理出错:', err);
         });
+        this.persistIfSqlJs();
       }, CACHE_CLEANUP_INTERVAL_MS);
     } catch (err) {
       console.error(`[SQLite] 打开数据库失败:`, err);
       throw err;
     }
+  }
 
-    // 进程退出时关闭数据库
-    process.once('exit', () => this.close());
+  /** sql.js 引擎在写操作后需要持久化到磁盘 */
+  private persistIfSqlJs(): void {
+    if (this.engine === 'sql.js' && this.db instanceof SqlJsAdapter) {
+      this.db.save();
+    }
+  }
+
+  private async ensureReady(): Promise<void> {
+    await this.ready;
   }
 
   // ==================== 初始化 & 关闭 ====================
@@ -192,6 +394,7 @@ export class SqliteStorage implements IStorage {
     userName: string,
     key: string,
   ): Promise<PlayRecord | null> {
+    await this.ensureReady();
     const row = this.db
       .prepare('SELECT value FROM play_records WHERE username = ? AND key = ?')
       .get(userName, key) as { value: string } | undefined;
@@ -203,16 +406,19 @@ export class SqliteStorage implements IStorage {
     key: string,
     record: PlayRecord,
   ): Promise<void> {
+    await this.ensureReady();
     this.db
       .prepare(
         'INSERT OR REPLACE INTO play_records (username, key, value) VALUES (?, ?, ?)',
       )
       .run(userName, key, JSON.stringify(record));
+    this.persistIfSqlJs();
   }
 
   async getAllPlayRecords(
     userName: string,
   ): Promise<Record<string, PlayRecord>> {
+    await this.ensureReady();
     const rows = this.db
       .prepare('SELECT key, value FROM play_records WHERE username = ?')
       .all(userName) as Array<{ key: string; value: string }>;
@@ -224,15 +430,18 @@ export class SqliteStorage implements IStorage {
   }
 
   async deletePlayRecord(userName: string, key: string): Promise<void> {
+    await this.ensureReady();
     this.db
       .prepare('DELETE FROM play_records WHERE username = ? AND key = ?')
       .run(userName, key);
+    this.persistIfSqlJs();
   }
 
   async setPlayRecordsBatch(
     userName: string,
     records: Record<string, PlayRecord>,
   ): Promise<void> {
+    await this.ensureReady();
     const entries = Object.entries(records);
     if (entries.length === 0) return;
 
@@ -249,11 +458,13 @@ export class SqliteStorage implements IStorage {
       this.db.exec('ROLLBACK');
       throw e;
     }
+    this.persistIfSqlJs();
   }
 
   // ==================== 收藏 ====================
 
   async getFavorite(userName: string, key: string): Promise<Favorite | null> {
+    await this.ensureReady();
     const row = this.db
       .prepare('SELECT value FROM favorites WHERE username = ? AND key = ?')
       .get(userName, key) as { value: string } | undefined;
@@ -265,14 +476,17 @@ export class SqliteStorage implements IStorage {
     key: string,
     favorite: Favorite,
   ): Promise<void> {
+    await this.ensureReady();
     this.db
       .prepare(
         'INSERT OR REPLACE INTO favorites (username, key, value) VALUES (?, ?, ?)',
       )
       .run(userName, key, JSON.stringify(favorite));
+    this.persistIfSqlJs();
   }
 
   async getAllFavorites(userName: string): Promise<Record<string, Favorite>> {
+    await this.ensureReady();
     const rows = this.db
       .prepare('SELECT key, value FROM favorites WHERE username = ?')
       .all(userName) as Array<{ key: string; value: string }>;
@@ -284,15 +498,18 @@ export class SqliteStorage implements IStorage {
   }
 
   async deleteFavorite(userName: string, key: string): Promise<void> {
+    await this.ensureReady();
     this.db
       .prepare('DELETE FROM favorites WHERE username = ? AND key = ?')
       .run(userName, key);
+    this.persistIfSqlJs();
   }
 
   async setFavoritesBatch(
     userName: string,
     favorites: Record<string, Favorite>,
   ): Promise<void> {
+    await this.ensureReady();
     const entries = Object.entries(favorites);
     if (entries.length === 0) return;
 
@@ -309,11 +526,13 @@ export class SqliteStorage implements IStorage {
       this.db.exec('ROLLBACK');
       throw e;
     }
+    this.persistIfSqlJs();
   }
 
   // ==================== 提醒 ====================
 
   async getReminder(userName: string, key: string): Promise<Reminder | null> {
+    await this.ensureReady();
     const row = this.db
       .prepare('SELECT value FROM reminders WHERE username = ? AND key = ?')
       .get(userName, key) as { value: string } | undefined;
@@ -325,14 +544,17 @@ export class SqliteStorage implements IStorage {
     key: string,
     reminder: Reminder,
   ): Promise<void> {
+    await this.ensureReady();
     this.db
       .prepare(
         'INSERT OR REPLACE INTO reminders (username, key, value) VALUES (?, ?, ?)',
       )
       .run(userName, key, JSON.stringify(reminder));
+    this.persistIfSqlJs();
   }
 
   async getAllReminders(userName: string): Promise<Record<string, Reminder>> {
+    await this.ensureReady();
     const rows = this.db
       .prepare('SELECT key, value FROM reminders WHERE username = ?')
       .all(userName) as Array<{ key: string; value: string }>;
@@ -344,23 +566,28 @@ export class SqliteStorage implements IStorage {
   }
 
   async deleteReminder(userName: string, key: string): Promise<void> {
+    await this.ensureReady();
     this.db
       .prepare('DELETE FROM reminders WHERE username = ? AND key = ?')
       .run(userName, key);
+    this.persistIfSqlJs();
   }
 
   // ==================== 用户 V1 ====================
 
   async registerUser(userName: string, password: string): Promise<void> {
+    await this.ensureReady();
     const hashed = hashPwd(password);
     this.db
       .prepare(
         'INSERT OR REPLACE INTO users (username, password_hash, created_at) VALUES (?, ?, ?)',
       )
       .run(userName, hashed, Date.now());
+    this.persistIfSqlJs();
   }
 
   async verifyUser(userName: string, password: string): Promise<boolean> {
+    await this.ensureReady();
     const row = this.db
       .prepare('SELECT password_hash FROM users WHERE username = ?')
       .get(userName) as { password_hash: string } | undefined;
@@ -375,12 +602,14 @@ export class SqliteStorage implements IStorage {
       this.db
         .prepare('UPDATE users SET password_hash = ? WHERE username = ?')
         .run(hashed, userName);
+      this.persistIfSqlJs();
     }
 
     return ok;
   }
 
   async checkUserExist(userName: string): Promise<boolean> {
+    await this.ensureReady();
     const row = this.db
       .prepare('SELECT 1 FROM users WHERE username = ?')
       .get(userName);
@@ -388,13 +617,16 @@ export class SqliteStorage implements IStorage {
   }
 
   async changePassword(userName: string, newPassword: string): Promise<void> {
+    await this.ensureReady();
     const hashed = hashPwd(newPassword);
     this.db
       .prepare('UPDATE users SET password_hash = ? WHERE username = ?')
       .run(hashed, userName);
+    this.persistIfSqlJs();
   }
 
   async deleteUser(userName: string): Promise<void> {
+    await this.ensureReady();
     this.db.exec('BEGIN');
     try {
       // V1 用户
@@ -427,6 +659,7 @@ export class SqliteStorage implements IStorage {
       this.db.exec('ROLLBACK');
       throw e;
     }
+    this.persistIfSqlJs();
   }
 
   // ==================== 用户 V2（OIDC 支持）====================
@@ -444,6 +677,7 @@ export class SqliteStorage implements IStorage {
     oidcSub?: string,
     enabledApis?: string[],
   ): Promise<void> {
+    await this.ensureReady();
     const hashedPassword = this.hashPasswordV2(password);
     const createdAt = Date.now();
 
@@ -462,9 +696,11 @@ export class SqliteStorage implements IStorage {
         oidcSub || null,
         createdAt,
       );
+    this.persistIfSqlJs();
   }
 
   async verifyUserV2(userName: string, password: string): Promise<boolean> {
+    await this.ensureReady();
     const row = this.db
       .prepare('SELECT password FROM users_v2 WHERE username = ?')
       .get(userName) as { password: string } | undefined;
@@ -473,6 +709,7 @@ export class SqliteStorage implements IStorage {
   }
 
   async checkUserExistV2(userName: string): Promise<boolean> {
+    await this.ensureReady();
     const row = this.db
       .prepare('SELECT 1 FROM users_v2 WHERE username = ?')
       .get(userName);
@@ -488,6 +725,7 @@ export class SqliteStorage implements IStorage {
     createdAt?: number;
     oidcSub?: string;
   } | null> {
+    await this.ensureReady();
     const row = this.db
       .prepare('SELECT * FROM users_v2 WHERE username = ?')
       .get(userName) as
@@ -530,6 +768,7 @@ export class SqliteStorage implements IStorage {
   }
 
   async getUserByOidcSub(oidcSub: string): Promise<string | null> {
+    await this.ensureReady();
     const row = this.db
       .prepare('SELECT username FROM users_v2 WHERE oidc_sub = ?')
       .get(oidcSub) as { username: string } | undefined;
@@ -539,6 +778,7 @@ export class SqliteStorage implements IStorage {
   // ==================== 搜索历史 ====================
 
   async getSearchHistory(userName: string): Promise<string[]> {
+    await this.ensureReady();
     const rows = this.db
       .prepare(
         'SELECT keyword FROM search_history WHERE username = ? ORDER BY created_at DESC',
@@ -548,6 +788,7 @@ export class SqliteStorage implements IStorage {
   }
 
   async addSearchHistory(userName: string, keyword: string): Promise<void> {
+    await this.ensureReady();
     this.db.exec('BEGIN');
     try {
       // 去重
@@ -583,9 +824,11 @@ export class SqliteStorage implements IStorage {
       this.db.exec('ROLLBACK');
       throw e;
     }
+    this.persistIfSqlJs();
   }
 
   async deleteSearchHistory(userName: string, keyword?: string): Promise<void> {
+    await this.ensureReady();
     if (keyword) {
       this.db
         .prepare(
@@ -597,11 +840,13 @@ export class SqliteStorage implements IStorage {
         .prepare('DELETE FROM search_history WHERE username = ?')
         .run(userName);
     }
+    this.persistIfSqlJs();
   }
 
   // ==================== 用户列表 ====================
 
   async getAllUsers(): Promise<string[]> {
+    await this.ensureReady();
     // 优先 V2 用户列表
     const v2Rows = this.db
       .prepare('SELECT username FROM users_v2 ORDER BY created_at ASC')
@@ -618,6 +863,7 @@ export class SqliteStorage implements IStorage {
   // ==================== 管理员配置 ====================
 
   async getAdminConfig(): Promise<AdminConfig | null> {
+    await this.ensureReady();
     const row = this.db
       .prepare('SELECT value FROM admin_config WHERE id = 1')
       .get() as { value: string } | undefined;
@@ -625,9 +871,11 @@ export class SqliteStorage implements IStorage {
   }
 
   async setAdminConfig(config: AdminConfig): Promise<void> {
+    await this.ensureReady();
     this.db
       .prepare('INSERT OR REPLACE INTO admin_config (id, value) VALUES (1, ?)')
       .run(JSON.stringify(config));
+    this.persistIfSqlJs();
   }
 
   // ==================== 跳过片头片尾配置 ====================
@@ -641,6 +889,7 @@ export class SqliteStorage implements IStorage {
     source: string,
     id: string,
   ): Promise<EpisodeSkipConfig | null> {
+    await this.ensureReady();
     const row = this.db
       .prepare(
         'SELECT value FROM skip_configs WHERE username = ? AND source = ? AND id = ?',
@@ -655,11 +904,13 @@ export class SqliteStorage implements IStorage {
     id: string,
     config: EpisodeSkipConfig,
   ): Promise<void> {
+    await this.ensureReady();
     this.db
       .prepare(
         'INSERT OR REPLACE INTO skip_configs (username, source, id, value) VALUES (?, ?, ?, ?)',
       )
       .run(userName, source, id, JSON.stringify(config));
+    this.persistIfSqlJs();
   }
 
   async deleteSkipConfig(
@@ -667,16 +918,19 @@ export class SqliteStorage implements IStorage {
     source: string,
     id: string,
   ): Promise<void> {
+    await this.ensureReady();
     this.db
       .prepare(
         'DELETE FROM skip_configs WHERE username = ? AND source = ? AND id = ?',
       )
       .run(userName, source, id);
+    this.persistIfSqlJs();
   }
 
   async getAllSkipConfigs(
     userName: string,
   ): Promise<Record<string, EpisodeSkipConfig>> {
+    await this.ensureReady();
     const rows = this.db
       .prepare('SELECT source, id, value FROM skip_configs WHERE username = ?')
       .all(userName) as Array<{ source: string; id: string; value: string }>;
@@ -696,6 +950,7 @@ export class SqliteStorage implements IStorage {
     source: string,
     id: string,
   ): Promise<EpisodeSkipConfig | null> {
+    await this.ensureReady();
     const row = this.db
       .prepare(
         'SELECT value FROM episode_skip_configs WHERE username = ? AND source = ? AND id = ?',
@@ -710,11 +965,13 @@ export class SqliteStorage implements IStorage {
     id: string,
     config: EpisodeSkipConfig,
   ): Promise<void> {
+    await this.ensureReady();
     this.db
       .prepare(
         'INSERT OR REPLACE INTO episode_skip_configs (username, source, id, value) VALUES (?, ?, ?, ?)',
       )
       .run(userName, source, id, JSON.stringify(config));
+    this.persistIfSqlJs();
   }
 
   async deleteEpisodeSkipConfig(
@@ -722,16 +979,19 @@ export class SqliteStorage implements IStorage {
     source: string,
     id: string,
   ): Promise<void> {
+    await this.ensureReady();
     this.db
       .prepare(
         'DELETE FROM episode_skip_configs WHERE username = ? AND source = ? AND id = ?',
       )
       .run(userName, source, id);
+    this.persistIfSqlJs();
   }
 
   async getAllEpisodeSkipConfigs(
     userName: string,
   ): Promise<Record<string, EpisodeSkipConfig>> {
+    await this.ensureReady();
     const rows = this.db
       .prepare(
         'SELECT source, id, value FROM episode_skip_configs WHERE username = ?',
@@ -749,6 +1009,7 @@ export class SqliteStorage implements IStorage {
   // ==================== 数据清理 ====================
 
   async clearAllData(): Promise<void> {
+    await this.ensureReady();
     const tables = [
       'users',
       'users_v2',
@@ -774,12 +1035,14 @@ export class SqliteStorage implements IStorage {
       this.db.exec('ROLLBACK');
       throw e;
     }
+    this.persistIfSqlJs();
     console.log('[SQLite] 所有数据已清空');
   }
 
   // ==================== 通用缓存 ====================
 
   async getCache(key: string): Promise<any | null> {
+    await this.ensureReady();
     const row = this.db
       .prepare(
         'SELECT value FROM cache WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)',
@@ -799,6 +1062,7 @@ export class SqliteStorage implements IStorage {
     data: any,
     expireSeconds?: number,
   ): Promise<void> {
+    await this.ensureReady();
     const expiresAt =
       expireSeconds !== undefined ? Date.now() + expireSeconds * 1000 : null;
     this.db
@@ -806,13 +1070,17 @@ export class SqliteStorage implements IStorage {
         'INSERT OR REPLACE INTO cache (key, value, expires_at) VALUES (?, ?, ?)',
       )
       .run(key, JSON.stringify(data), expiresAt);
+    this.persistIfSqlJs();
   }
 
   async deleteCache(key: string): Promise<void> {
+    await this.ensureReady();
     this.db.prepare('DELETE FROM cache WHERE key = ?').run(key);
+    this.persistIfSqlJs();
   }
 
   async clearExpiredCache(prefix?: string): Promise<void> {
+    await this.ensureReady();
     const now = Date.now();
     if (prefix) {
       this.db
@@ -827,12 +1095,14 @@ export class SqliteStorage implements IStorage {
         )
         .run(now);
     }
+    this.persistIfSqlJs();
   }
 
   // ==================== 播放统计 ====================
 
   async getPlayStats(): Promise<PlayStatsResult> {
     try {
+      await this.ensureReady();
       // 尝试从缓存获取
       const cached = await this.getCache('play_stats_summary');
       if (cached) return cached;
@@ -969,6 +1239,7 @@ export class SqliteStorage implements IStorage {
 
   async getUserPlayStat(userName: string): Promise<UserPlayStat> {
     try {
+      await this.ensureReady();
       const records = await this.getAllPlayRecords(userName);
       const values = Object.values(records);
 
@@ -1105,6 +1376,7 @@ export class SqliteStorage implements IStorage {
 
   async getContentStats(limit = 10): Promise<ContentStat[]> {
     try {
+      await this.ensureReady();
       // 使用 SQL 聚合分组，避免 json_extract 依赖
       const grouped = this.db
         .prepare(
@@ -1193,8 +1465,15 @@ export class SqliteStorage implements IStorage {
     userName: string,
     loginTime: number,
     isFirstLogin?: boolean,
-    loginMeta?: { ip?: string; location?: string; device?: string; browser?: string; os?: string }
+    loginMeta?: {
+      ip?: string;
+      location?: string;
+      device?: string;
+      browser?: string;
+      os?: string;
+    },
   ): Promise<void> {
+    await this.ensureReady();
     const row = this.db
       .prepare('SELECT * FROM login_stats WHERE username = ?')
       .get(userName) as any;
@@ -1219,18 +1498,24 @@ export class SqliteStorage implements IStorage {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
-        userName, loginCount, firstLoginTime, loginTime, loginTime,
+        userName,
+        loginCount,
+        firstLoginTime,
+        loginTime,
+        loginTime,
         loginMeta?.ip ?? (row?.last_login_ip ?? null),
         loginMeta?.location ?? (row?.last_login_location ?? null),
         loginMeta?.device ?? (row?.last_login_device ?? null),
         loginMeta?.browser ?? (row?.last_login_browser ?? null),
         loginMeta?.os ?? (row?.last_login_os ?? null),
       );
+    this.persistIfSqlJs();
   }
 
   // ==================== Emby 配置 ====================
 
   async getUserEmbyConfig(userName: string): Promise<any | null> {
+    await this.ensureReady();
     const row = this.db
       .prepare('SELECT value FROM emby_configs WHERE username = ?')
       .get(userName) as { value: string } | undefined;
@@ -1238,30 +1523,37 @@ export class SqliteStorage implements IStorage {
   }
 
   async saveUserEmbyConfig(userName: string, config: any): Promise<void> {
+    await this.ensureReady();
     this.db
       .prepare(
         'INSERT OR REPLACE INTO emby_configs (username, value) VALUES (?, ?)',
       )
       .run(userName, JSON.stringify(config));
+    this.persistIfSqlJs();
   }
 
   async deleteUserEmbyConfig(userName: string): Promise<void> {
+    await this.ensureReady();
     this.db
       .prepare('DELETE FROM emby_configs WHERE username = ?')
       .run(userName);
+    this.persistIfSqlJs();
   }
 
   // ==================== 崩溃日志 ====================
 
   async saveCrashLog(crashLog: CrashLog): Promise<void> {
+    await this.ensureReady();
     this.db
       .prepare(
         'INSERT OR REPLACE INTO crash_logs (timestamp, value, created_at) VALUES (?, ?, ?)',
       )
       .run(crashLog.timestamp, JSON.stringify(crashLog), Date.now());
+    this.persistIfSqlJs();
   }
 
   async getCrashLogs(limit = 50): Promise<CrashLog[]> {
+    await this.ensureReady();
     const rows = this.db
       .prepare('SELECT value FROM crash_logs ORDER BY created_at DESC LIMIT ?')
       .all(limit) as Array<{ value: string }>;
@@ -1269,12 +1561,16 @@ export class SqliteStorage implements IStorage {
   }
 
   async deleteCrashLog(timestamp: string): Promise<void> {
+    await this.ensureReady();
     this.db
       .prepare('DELETE FROM crash_logs WHERE timestamp = ?')
       .run(timestamp);
+    this.persistIfSqlJs();
   }
 
   async clearCrashLogs(): Promise<void> {
+    await this.ensureReady();
     this.db.prepare('DELETE FROM crash_logs').run();
+    this.persistIfSqlJs();
   }
 }
