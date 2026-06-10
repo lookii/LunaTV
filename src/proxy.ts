@@ -5,7 +5,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getAuthInfoFromCookie } from '@/lib/auth';
 
 // 信任网络配置缓存（从 API 获取）
-let trustedNetworkCache: { enabled: boolean; trustedIPs: string[]; blockAdminAccess: boolean } | null = null;
+let trustedNetworkCache: { enabled: boolean; trustedIPs: string[] } | null = null;
 let trustedNetworkCacheTime = 0;
 let trustedNetworkFetched = false;
 let trustedNetworkVersion = ''; // 跟踪配置版本，用于立即失效缓存
@@ -13,19 +13,18 @@ let trustedNetworkVersion = ''; // 跟踪配置版本，用于立即失效缓存
 const CACHE_TTL = 86400000; // 24 小时缓存（配置变化时通过 cookie 版本号立即刷新）
 
 // 从环境变量获取信任网络配置（优先）
-function getTrustedNetworkFromEnv(): { enabled: boolean; trustedIPs: string[]; blockAdminAccess: boolean } | null {
+function getTrustedNetworkFromEnv(): { enabled: boolean; trustedIPs: string[] } | null {
   const trustedIPs = process.env.TRUSTED_NETWORK_IPS;
   if (!trustedIPs) return null;
 
   return {
     enabled: true,
     trustedIPs: trustedIPs.split(',').map(ip => ip.trim()).filter(Boolean),
-    blockAdminAccess: false,
   };
 }
 
 // 从 API 获取信任网络配置（数据库）
-async function getTrustedNetworkFromAPI(request: NextRequest): Promise<{ enabled: boolean; trustedIPs: string[]; blockAdminAccess: boolean } | null> {
+async function getTrustedNetworkFromAPI(request: NextRequest): Promise<{ enabled: boolean; trustedIPs: string[] } | null> {
   const now = Date.now();
 
   // 检查缓存是否有效
@@ -64,7 +63,6 @@ async function getTrustedNetworkFromAPI(request: NextRequest): Promise<{ enabled
         trustedNetworkCache = {
           enabled: data.TrustedNetworkConfig.enabled ?? false,
           trustedIPs: data.TrustedNetworkConfig.trustedIPs || [],
-          blockAdminAccess: data.TrustedNetworkConfig.blockAdminAccess === true,
         };
 
         if (!trustedNetworkCache.enabled) {
@@ -76,17 +74,17 @@ async function getTrustedNetworkFromAPI(request: NextRequest): Promise<{ enabled
     }
 
     // API 返回但没有配置 - 标记为禁用而不是 null，这样走禁用缓存逻辑
-    trustedNetworkCache = { enabled: false, trustedIPs: [], blockAdminAccess: false };
+    trustedNetworkCache = { enabled: false, trustedIPs: [] };
   } catch {
     // 请求失败时标记为禁用，使用长缓存时间避免频繁重试
-    trustedNetworkCache = { enabled: false, trustedIPs: [], blockAdminAccess: false };
+    trustedNetworkCache = { enabled: false, trustedIPs: [] };
   }
 
   return null;
 }
 
 // 获取信任网络配置（环境变量优先，然后数据库）
-async function getTrustedNetworkConfig(request: NextRequest): Promise<{ enabled: boolean; trustedIPs: string[]; blockAdminAccess: boolean } | null> {
+async function getTrustedNetworkConfig(request: NextRequest): Promise<{ enabled: boolean; trustedIPs: string[] } | null> {
   // 环境变量优先
   const envConfig = getTrustedNetworkFromEnv();
   if (envConfig) return envConfig;
@@ -265,25 +263,16 @@ async function handleAuthentication(
     const clientIP = getClientIP(request);
 
     if (isIPTrusted(clientIP, trustedNetworkConfig.trustedIPs)) {
-      // 加固开关：禁止信任网络访客访问后台
-      // 命中 /admin 或 /api/admin/* 时，跳过自动登录分支，落到下方密码/签名校验
-      const isAdminPath =
-        pathname.startsWith('/admin') || pathname.startsWith('/api/admin');
-      if (trustedNetworkConfig.blockAdminAccess && isAdminPath) {
-        // 不签发也不复用 trustedNetwork cookie，让请求走标准认证流程
-        // 后面 authInfo.trustedNetwork 短路那里还会再拦一次（针对已有 cookie 的情况）
-      } else {
-        console.log(`[Middleware] Trusted network auto-login for IP: ${clientIP}`);
+      console.log(`[Middleware] Trusted network auto-login for IP: ${clientIP}`);
 
-        // 检查是否已经有有效的认证 cookie
-        const existingAuth = getAuthInfoFromCookie(request);
-        if (existingAuth && (existingAuth.password || existingAuth.trustedNetwork || existingAuth.signature)) {
-          return response || NextResponse.next();
-        }
-
-        // 没有认证 cookie，自动生成并设置
-        return generateTrustedAuthCookie(request);
+      // 检查是否已经有有效的认证 cookie
+      const existingAuth = getAuthInfoFromCookie(request);
+      if (existingAuth && (existingAuth.password || existingAuth.trustedNetwork || existingAuth.signature)) {
+        return response || NextResponse.next();
       }
+
+      // 没有认证 cookie，自动生成并设置
+      return generateTrustedAuthCookie(request);
     }
   }
 
@@ -313,13 +302,6 @@ async function handleAuthentication(
   // 其他模式：验证签名或信任网络标记
   // 🔥 信任网络模式：检查 trustedNetwork 标记
   if (authInfo.trustedNetwork) {
-    // 加固开关：信任网络访客的 cookie 不允许进入后台
-    if (
-      trustedNetworkConfig?.blockAdminAccess &&
-      (pathname.startsWith('/admin') || pathname.startsWith('/api/admin'))
-    ) {
-      return NextResponse.redirect(new URL('/login', request.url));
-    }
     return response || NextResponse.next();
   }
 
