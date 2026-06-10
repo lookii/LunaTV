@@ -1,7 +1,7 @@
 /* eslint-disable no-console */
 import { createHash } from 'crypto';
 import fs from 'fs';
-import { DatabaseSync } from 'node:sqlite';
+import initSqlJs, { Database as SqlJsDatabase } from 'sql.js';
 import path from 'path';
 
 import { AdminConfig } from './admin.types';
@@ -22,50 +22,123 @@ const SEARCH_HISTORY_LIMIT = 20;
 const CACHE_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 60 分钟
 
 export class SqliteStorage implements IStorage {
-  private db!: DatabaseSync;
+  private db!: SqlJsDatabase;
+  private dbPath: string | null = null;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
+  private ready: Promise<void>;
 
   constructor() {
     const isBuild = process.env.IS_BUILD_PHASE === 'true';
 
     if (isBuild) {
-      this.db = new DatabaseSync(':memory:');
-      this.initTables();
+      this.ready = this.initMemory();
       return;
     }
 
-    const dbPath =
+    this.dbPath =
       process.env.SQLITE_DB_PATH ||
       path.join(process.cwd(), 'data', 'lunatv.db');
-    const dbDir = path.dirname(dbPath);
+    const dbDir = path.dirname(this.dbPath);
 
     // 自动创建数据库目录
     if (!fs.existsSync(dbDir)) {
       fs.mkdirSync(dbDir, { recursive: true });
     }
 
+    this.ready = this.initFromFile(this.dbPath);
+
+    // 进程退出时关闭数据库
+    process.once('exit', () => this.close());
+  }
+
+  // ==================== 异步初始化 ====================
+
+  private async initMemory(): Promise<void> {
+    const SQL = await initSqlJs();
+    this.db = new SQL.Database();
+    this.initTables();
+  }
+
+  private async initFromFile(dbPath: string): Promise<void> {
+    const SQL = await initSqlJs();
     console.log(`[SQLite] 正在打开数据库: ${dbPath}`);
     try {
-      this.db = new DatabaseSync(dbPath);
+      if (fs.existsSync(dbPath)) {
+        const buffer = fs.readFileSync(dbPath);
+        this.db = new SQL.Database(buffer);
+      } else {
+        this.db = new SQL.Database();
+      }
 
       // WAL 模式 — 提升并发读性能
-      this.db.exec('PRAGMA journal_mode = WAL');
+      this.db.run('PRAGMA journal_mode = WAL');
 
       this.initTables();
 
-      // 定时清理过期缓存
+      // 定时清理过期缓存 + 持久化
       this.cleanupTimer = setInterval(() => {
         this.clearExpiredCache().catch((err) => {
           console.error('[SQLite] 缓存清理出错:', err);
         });
+        this.saveToFile();
       }, CACHE_CLEANUP_INTERVAL_MS);
     } catch (err) {
       console.error(`[SQLite] 打开数据库失败:`, err);
       throw err;
     }
+  }
 
-    // 进程退出时关闭数据库
-    process.once('exit', () => this.close());
+  /** 确保数据库已完成异步初始化 */
+  private async ensureReady(): Promise<void> {
+    await this.ready;
+  }
+
+  /** 将内存数据库持久化到磁盘文件 */
+  private saveToFile(): void {
+    if (!this.dbPath || !this.db) return;
+    try {
+      const data = this.db.export();
+      fs.writeFileSync(this.dbPath, Buffer.from(data));
+    } catch (err) {
+      console.error('[SQLite] 保存数据库失败:', err);
+    }
+  }
+
+  // ==================== 查询辅助方法 ====================
+
+  /** 执行无参数的 SQL（DDL / 事务控制） */
+  private exec(sql: string): void {
+    this.db.exec(sql);
+  }
+
+  /** 执行带参数的单条写入 SQL，并自动持久化 */
+  private run(sql: string, ...params: unknown[]): void {
+    this.db.run(sql, params as initSqlJs.BindParams);
+    this.saveToFile();
+  }
+
+  /** 查询多行，返回对象数组 */
+  private queryAll(sql: string, ...params: unknown[]): Record<string, unknown>[] {
+    const stmt = this.db.prepare(sql);
+    if (params.length > 0) stmt.bind(params as initSqlJs.BindParams);
+    const results: Record<string, unknown>[] = [];
+    while (stmt.step()) {
+      results.push(stmt.getAsObject());
+    }
+    stmt.free();
+    return results;
+  }
+
+  /** 查询单行，返回对象或 undefined */
+  private queryOne(sql: string, ...params: unknown[]): Record<string, unknown> | undefined {
+    const stmt = this.db.prepare(sql);
+    if (params.length > 0) stmt.bind(params as initSqlJs.BindParams);
+    let result: Record<string, unknown> | undefined;
+    if (stmt.step()) {
+      result = stmt.getAsObject();
+    }
+    stmt.free();
+    return result;
   }
 
   // ==================== 初始化 & 关闭 ====================
@@ -179,6 +252,7 @@ export class SqliteStorage implements IStorage {
       this.cleanupTimer = null;
     }
     try {
+      this.saveToFile();
       this.db.close();
       console.log('[SQLite] 数据库已关闭');
     } catch {
@@ -192,9 +266,11 @@ export class SqliteStorage implements IStorage {
     userName: string,
     key: string,
   ): Promise<PlayRecord | null> {
-    const row = this.db
-      .prepare('SELECT value FROM play_records WHERE username = ? AND key = ?')
-      .get(userName, key) as { value: string } | undefined;
+    const row = this.queryOne(
+      'SELECT value FROM play_records WHERE username = ? AND key = ?',
+      userName,
+      key,
+    ) as { value: string } | undefined;
     return row ? (JSON.parse(row.value) as PlayRecord) : null;
   }
 
@@ -203,19 +279,21 @@ export class SqliteStorage implements IStorage {
     key: string,
     record: PlayRecord,
   ): Promise<void> {
-    this.db
-      .prepare(
-        'INSERT OR REPLACE INTO play_records (username, key, value) VALUES (?, ?, ?)',
-      )
-      .run(userName, key, JSON.stringify(record));
+    this.run(
+      'INSERT OR REPLACE INTO play_records (username, key, value) VALUES (?, ?, ?)',
+      userName,
+      key,
+      JSON.stringify(record),
+    );
   }
 
   async getAllPlayRecords(
     userName: string,
   ): Promise<Record<string, PlayRecord>> {
-    const rows = this.db
-      .prepare('SELECT key, value FROM play_records WHERE username = ?')
-      .all(userName) as Array<{ key: string; value: string }>;
+    const rows = this.queryAll(
+      'SELECT key, value FROM play_records WHERE username = ?',
+      userName,
+    ) as Array<{ key: string; value: string }>;
     const result: Record<string, PlayRecord> = {};
     for (const row of rows) {
       result[row.key] = JSON.parse(row.value) as PlayRecord;
@@ -224,9 +302,11 @@ export class SqliteStorage implements IStorage {
   }
 
   async deletePlayRecord(userName: string, key: string): Promise<void> {
-    this.db
-      .prepare('DELETE FROM play_records WHERE username = ? AND key = ?')
-      .run(userName, key);
+    this.run(
+      'DELETE FROM play_records WHERE username = ? AND key = ?',
+      userName,
+      key,
+    );
   }
 
   async setPlayRecordsBatch(
@@ -236,27 +316,29 @@ export class SqliteStorage implements IStorage {
     const entries = Object.entries(records);
     if (entries.length === 0) return;
 
-    const insert = this.db.prepare(
-      'INSERT OR REPLACE INTO play_records (username, key, value) VALUES (?, ?, ?)',
-    );
-    this.db.exec('BEGIN');
+    const sql =
+      'INSERT OR REPLACE INTO play_records (username, key, value) VALUES (?, ?, ?)';
+    this.exec('BEGIN');
     try {
       for (const [key, record] of entries) {
-        insert.run(userName, key, JSON.stringify(record));
+        this.db.run(sql, [userName, key, JSON.stringify(record)]);
       }
-      this.db.exec('COMMIT');
+      this.exec('COMMIT');
     } catch (e) {
-      this.db.exec('ROLLBACK');
+      this.exec('ROLLBACK');
       throw e;
     }
+    this.saveToFile();
   }
 
   // ==================== 收藏 ====================
 
   async getFavorite(userName: string, key: string): Promise<Favorite | null> {
-    const row = this.db
-      .prepare('SELECT value FROM favorites WHERE username = ? AND key = ?')
-      .get(userName, key) as { value: string } | undefined;
+    const row = this.queryOne(
+      'SELECT value FROM favorites WHERE username = ? AND key = ?',
+      userName,
+      key,
+    ) as { value: string } | undefined;
     return row ? (JSON.parse(row.value) as Favorite) : null;
   }
 
@@ -265,17 +347,19 @@ export class SqliteStorage implements IStorage {
     key: string,
     favorite: Favorite,
   ): Promise<void> {
-    this.db
-      .prepare(
-        'INSERT OR REPLACE INTO favorites (username, key, value) VALUES (?, ?, ?)',
-      )
-      .run(userName, key, JSON.stringify(favorite));
+    this.run(
+      'INSERT OR REPLACE INTO favorites (username, key, value) VALUES (?, ?, ?)',
+      userName,
+      key,
+      JSON.stringify(favorite),
+    );
   }
 
   async getAllFavorites(userName: string): Promise<Record<string, Favorite>> {
-    const rows = this.db
-      .prepare('SELECT key, value FROM favorites WHERE username = ?')
-      .all(userName) as Array<{ key: string; value: string }>;
+    const rows = this.queryAll(
+      'SELECT key, value FROM favorites WHERE username = ?',
+      userName,
+    ) as Array<{ key: string; value: string }>;
     const result: Record<string, Favorite> = {};
     for (const row of rows) {
       result[row.key] = JSON.parse(row.value) as Favorite;
@@ -284,9 +368,11 @@ export class SqliteStorage implements IStorage {
   }
 
   async deleteFavorite(userName: string, key: string): Promise<void> {
-    this.db
-      .prepare('DELETE FROM favorites WHERE username = ? AND key = ?')
-      .run(userName, key);
+    this.run(
+      'DELETE FROM favorites WHERE username = ? AND key = ?',
+      userName,
+      key,
+    );
   }
 
   async setFavoritesBatch(
@@ -296,27 +382,29 @@ export class SqliteStorage implements IStorage {
     const entries = Object.entries(favorites);
     if (entries.length === 0) return;
 
-    const insert = this.db.prepare(
-      'INSERT OR REPLACE INTO favorites (username, key, value) VALUES (?, ?, ?)',
-    );
-    this.db.exec('BEGIN');
+    const sql =
+      'INSERT OR REPLACE INTO favorites (username, key, value) VALUES (?, ?, ?)';
+    this.exec('BEGIN');
     try {
       for (const [key, fav] of entries) {
-        insert.run(userName, key, JSON.stringify(fav));
+        this.db.run(sql, [userName, key, JSON.stringify(fav)]);
       }
-      this.db.exec('COMMIT');
+      this.exec('COMMIT');
     } catch (e) {
-      this.db.exec('ROLLBACK');
+      this.exec('ROLLBACK');
       throw e;
     }
+    this.saveToFile();
   }
 
   // ==================== 提醒 ====================
 
   async getReminder(userName: string, key: string): Promise<Reminder | null> {
-    const row = this.db
-      .prepare('SELECT value FROM reminders WHERE username = ? AND key = ?')
-      .get(userName, key) as { value: string } | undefined;
+    const row = this.queryOne(
+      'SELECT value FROM reminders WHERE username = ? AND key = ?',
+      userName,
+      key,
+    ) as { value: string } | undefined;
     return row ? (JSON.parse(row.value) as Reminder) : null;
   }
 
@@ -325,17 +413,19 @@ export class SqliteStorage implements IStorage {
     key: string,
     reminder: Reminder,
   ): Promise<void> {
-    this.db
-      .prepare(
-        'INSERT OR REPLACE INTO reminders (username, key, value) VALUES (?, ?, ?)',
-      )
-      .run(userName, key, JSON.stringify(reminder));
+    this.run(
+      'INSERT OR REPLACE INTO reminders (username, key, value) VALUES (?, ?, ?)',
+      userName,
+      key,
+      JSON.stringify(reminder),
+    );
   }
 
   async getAllReminders(userName: string): Promise<Record<string, Reminder>> {
-    const rows = this.db
-      .prepare('SELECT key, value FROM reminders WHERE username = ?')
-      .all(userName) as Array<{ key: string; value: string }>;
+    const rows = this.queryAll(
+      'SELECT key, value FROM reminders WHERE username = ?',
+      userName,
+    ) as Array<{ key: string; value: string }>;
     const result: Record<string, Reminder> = {};
     for (const row of rows) {
       result[row.key] = JSON.parse(row.value) as Reminder;
@@ -344,26 +434,30 @@ export class SqliteStorage implements IStorage {
   }
 
   async deleteReminder(userName: string, key: string): Promise<void> {
-    this.db
-      .prepare('DELETE FROM reminders WHERE username = ? AND key = ?')
-      .run(userName, key);
+    this.run(
+      'DELETE FROM reminders WHERE username = ? AND key = ?',
+      userName,
+      key,
+    );
   }
 
   // ==================== 用户 V1 ====================
 
   async registerUser(userName: string, password: string): Promise<void> {
     const hashed = hashPwd(password);
-    this.db
-      .prepare(
-        'INSERT OR REPLACE INTO users (username, password_hash, created_at) VALUES (?, ?, ?)',
-      )
-      .run(userName, hashed, Date.now());
+    this.run(
+      'INSERT OR REPLACE INTO users (username, password_hash, created_at) VALUES (?, ?, ?)',
+      userName,
+      hashed,
+      Date.now(),
+    );
   }
 
   async verifyUser(userName: string, password: string): Promise<boolean> {
-    const row = this.db
-      .prepare('SELECT password_hash FROM users WHERE username = ?')
-      .get(userName) as { password_hash: string } | undefined;
+    const row = this.queryOne(
+      'SELECT password_hash FROM users WHERE username = ?',
+      userName,
+    ) as { password_hash: string } | undefined;
     if (!row) return false;
 
     const stored = row.password_hash;
@@ -372,61 +466,57 @@ export class SqliteStorage implements IStorage {
     // 平滑迁移：明文密码 → 加盐哈希
     if (ok && !isHashed(stored)) {
       const hashed = hashPwd(password);
-      this.db
-        .prepare('UPDATE users SET password_hash = ? WHERE username = ?')
-        .run(hashed, userName);
+      this.run(
+        'UPDATE users SET password_hash = ? WHERE username = ?',
+        hashed,
+        userName,
+      );
     }
 
     return ok;
   }
 
   async checkUserExist(userName: string): Promise<boolean> {
-    const row = this.db
-      .prepare('SELECT 1 FROM users WHERE username = ?')
-      .get(userName);
+    const row = this.queryOne(
+      'SELECT 1 FROM users WHERE username = ?',
+      userName,
+    );
     return !!row;
   }
 
   async changePassword(userName: string, newPassword: string): Promise<void> {
     const hashed = hashPwd(newPassword);
-    this.db
-      .prepare('UPDATE users SET password_hash = ? WHERE username = ?')
-      .run(hashed, userName);
+    this.run(
+      'UPDATE users SET password_hash = ? WHERE username = ?',
+      hashed,
+      userName,
+    );
   }
 
   async deleteUser(userName: string): Promise<void> {
-    this.db.exec('BEGIN');
+    this.exec('BEGIN');
     try {
       // V1 用户
-      this.db.prepare('DELETE FROM users WHERE username = ?').run(userName);
+      this.db.run('DELETE FROM users WHERE username = ?', [userName]);
       // V2 用户
-      this.db.prepare('DELETE FROM users_v2 WHERE username = ?').run(userName);
+      this.db.run('DELETE FROM users_v2 WHERE username = ?', [userName]);
       // 关联数据
-      this.db
-        .prepare('DELETE FROM play_records WHERE username = ?')
-        .run(userName);
-      this.db.prepare('DELETE FROM favorites WHERE username = ?').run(userName);
-      this.db.prepare('DELETE FROM reminders WHERE username = ?').run(userName);
-      this.db
-        .prepare('DELETE FROM search_history WHERE username = ?')
-        .run(userName);
-      this.db
-        .prepare('DELETE FROM skip_configs WHERE username = ?')
-        .run(userName);
-      this.db
-        .prepare('DELETE FROM episode_skip_configs WHERE username = ?')
-        .run(userName);
-      this.db
-        .prepare('DELETE FROM login_stats WHERE username = ?')
-        .run(userName);
-      this.db
-        .prepare('DELETE FROM emby_configs WHERE username = ?')
-        .run(userName);
-      this.db.exec('COMMIT');
+      this.db.run('DELETE FROM play_records WHERE username = ?', [userName]);
+      this.db.run('DELETE FROM favorites WHERE username = ?', [userName]);
+      this.db.run('DELETE FROM reminders WHERE username = ?', [userName]);
+      this.db.run('DELETE FROM search_history WHERE username = ?', [userName]);
+      this.db.run('DELETE FROM skip_configs WHERE username = ?', [userName]);
+      this.db.run('DELETE FROM episode_skip_configs WHERE username = ?', [
+        userName,
+      ]);
+      this.db.run('DELETE FROM login_stats WHERE username = ?', [userName]);
+      this.db.run('DELETE FROM emby_configs WHERE username = ?', [userName]);
+      this.exec('COMMIT');
     } catch (e) {
-      this.db.exec('ROLLBACK');
+      this.exec('ROLLBACK');
       throw e;
     }
+    this.saveToFile();
   }
 
   // ==================== 用户 V2（OIDC 支持）====================
@@ -447,35 +537,34 @@ export class SqliteStorage implements IStorage {
     const hashedPassword = this.hashPasswordV2(password);
     const createdAt = Date.now();
 
-    this.db
-      .prepare(
-        `INSERT OR REPLACE INTO users_v2
-         (username, password, role, banned, tags, enabled_apis, oidc_sub, created_at)
-         VALUES (?, ?, ?, 0, ?, ?, ?, ?)`,
-      )
-      .run(
-        userName,
-        hashedPassword,
-        role,
-        tags ? JSON.stringify(tags) : null,
-        enabledApis ? JSON.stringify(enabledApis) : null,
-        oidcSub || null,
-        createdAt,
-      );
+    this.run(
+      `INSERT OR REPLACE INTO users_v2
+       (username, password, role, banned, tags, enabled_apis, oidc_sub, created_at)
+       VALUES (?, ?, ?, 0, ?, ?, ?, ?)`,
+      userName,
+      hashedPassword,
+      role,
+      tags ? JSON.stringify(tags) : null,
+      enabledApis ? JSON.stringify(enabledApis) : null,
+      oidcSub || null,
+      createdAt,
+    );
   }
 
   async verifyUserV2(userName: string, password: string): Promise<boolean> {
-    const row = this.db
-      .prepare('SELECT password FROM users_v2 WHERE username = ?')
-      .get(userName) as { password: string } | undefined;
+    const row = this.queryOne(
+      'SELECT password FROM users_v2 WHERE username = ?',
+      userName,
+    ) as { password: string } | undefined;
     if (!row) return false;
     return row.password === this.hashPasswordV2(password);
   }
 
   async checkUserExistV2(userName: string): Promise<boolean> {
-    const row = this.db
-      .prepare('SELECT 1 FROM users_v2 WHERE username = ?')
-      .get(userName);
+    const row = this.queryOne(
+      'SELECT 1 FROM users_v2 WHERE username = ?',
+      userName,
+    );
     return !!row;
   }
 
@@ -488,9 +577,10 @@ export class SqliteStorage implements IStorage {
     createdAt?: number;
     oidcSub?: string;
   } | null> {
-    const row = this.db
-      .prepare('SELECT * FROM users_v2 WHERE username = ?')
-      .get(userName) as
+    const row = this.queryOne(
+      'SELECT * FROM users_v2 WHERE username = ?',
+      userName,
+    ) as
       | {
           username: string;
           password: string;
@@ -530,72 +620,67 @@ export class SqliteStorage implements IStorage {
   }
 
   async getUserByOidcSub(oidcSub: string): Promise<string | null> {
-    const row = this.db
-      .prepare('SELECT username FROM users_v2 WHERE oidc_sub = ?')
-      .get(oidcSub) as { username: string } | undefined;
+    const row = this.queryOne(
+      'SELECT username FROM users_v2 WHERE oidc_sub = ?',
+      oidcSub,
+    ) as { username: string } | undefined;
     return row ? row.username : null;
   }
 
   // ==================== 搜索历史 ====================
 
   async getSearchHistory(userName: string): Promise<string[]> {
-    const rows = this.db
-      .prepare(
-        'SELECT keyword FROM search_history WHERE username = ? ORDER BY created_at DESC',
-      )
-      .all(userName) as Array<{ keyword: string }>;
+    const rows = this.queryAll(
+      'SELECT keyword FROM search_history WHERE username = ? ORDER BY created_at DESC',
+      userName,
+    ) as Array<{ keyword: string }>;
     return rows.map((r) => r.keyword);
   }
 
   async addSearchHistory(userName: string, keyword: string): Promise<void> {
-    this.db.exec('BEGIN');
+    this.exec('BEGIN');
     try {
       // 去重
-      this.db
-        .prepare(
-          'DELETE FROM search_history WHERE username = ? AND keyword = ?',
-        )
-        .run(userName, keyword);
+      this.db.run(
+        'DELETE FROM search_history WHERE username = ? AND keyword = ?',
+        [userName, keyword],
+      );
       // 插入到最前
-      this.db
-        .prepare(
-          'INSERT INTO search_history (username, keyword, created_at) VALUES (?, ?, ?)',
-        )
-        .run(userName, keyword, Date.now());
+      this.db.run(
+        'INSERT INTO search_history (username, keyword, created_at) VALUES (?, ?, ?)',
+        [userName, keyword, Date.now()],
+      );
       // 限制最大条数
-      const count = this.db
-        .prepare(
-          'SELECT COUNT(*) as cnt FROM search_history WHERE username = ?',
-        )
-        .get(userName) as { cnt: number };
+      const count = this.queryOne(
+        'SELECT COUNT(*) as cnt FROM search_history WHERE username = ?',
+        userName,
+      ) as { cnt: number };
       if (count.cnt > SEARCH_HISTORY_LIMIT) {
-        this.db
-          .prepare(
-            `DELETE FROM search_history WHERE username = ? AND keyword NOT IN (
-              SELECT keyword FROM search_history
-              WHERE username = ? ORDER BY created_at DESC LIMIT ?
-            )`,
-          )
-          .run(userName, userName, SEARCH_HISTORY_LIMIT);
+        this.db.run(
+          `DELETE FROM search_history WHERE username = ? AND keyword NOT IN (
+            SELECT keyword FROM search_history
+            WHERE username = ? ORDER BY created_at DESC LIMIT ?
+          )`,
+          [userName, userName, SEARCH_HISTORY_LIMIT],
+        );
       }
-      this.db.exec('COMMIT');
+      this.exec('COMMIT');
     } catch (e) {
-      this.db.exec('ROLLBACK');
+      this.exec('ROLLBACK');
       throw e;
     }
+    this.saveToFile();
   }
 
   async deleteSearchHistory(userName: string, keyword?: string): Promise<void> {
     if (keyword) {
-      this.db
-        .prepare(
-          'DELETE FROM search_history WHERE username = ? AND keyword = ?',
-        )
-        .run(userName, keyword);
+      this.run(
+        'DELETE FROM search_history WHERE username = ? AND keyword = ?',
+        userName,
+        keyword,
+      );
     } else {
-      this.db
-        .prepare('DELETE FROM search_history WHERE username = ?')
-        .run(userName);
+      this.run('DELETE FROM search_history WHERE username = ?', userName);
     }
   }
 
@@ -603,31 +688,32 @@ export class SqliteStorage implements IStorage {
 
   async getAllUsers(): Promise<string[]> {
     // 优先 V2 用户列表
-    const v2Rows = this.db
-      .prepare('SELECT username FROM users_v2 ORDER BY created_at ASC')
-      .all() as Array<{ username: string }>;
+    const v2Rows = this.queryAll(
+      'SELECT username FROM users_v2 ORDER BY created_at ASC',
+    ) as Array<{ username: string }>;
     if (v2Rows.length > 0) return v2Rows.map((r) => r.username);
 
     // V1 降级兜底
-    const v1Rows = this.db
-      .prepare('SELECT username FROM users ORDER BY created_at ASC')
-      .all() as Array<{ username: string }>;
+    const v1Rows = this.queryAll(
+      'SELECT username FROM users ORDER BY created_at ASC',
+    ) as Array<{ username: string }>;
     return v1Rows.map((r) => r.username);
   }
 
   // ==================== 管理员配置 ====================
 
   async getAdminConfig(): Promise<AdminConfig | null> {
-    const row = this.db
-      .prepare('SELECT value FROM admin_config WHERE id = 1')
-      .get() as { value: string } | undefined;
+    const row = this.queryOne(
+      'SELECT value FROM admin_config WHERE id = 1',
+    ) as { value: string } | undefined;
     return row ? (JSON.parse(row.value) as AdminConfig) : null;
   }
 
   async setAdminConfig(config: AdminConfig): Promise<void> {
-    this.db
-      .prepare('INSERT OR REPLACE INTO admin_config (id, value) VALUES (1, ?)')
-      .run(JSON.stringify(config));
+    this.run(
+      'INSERT OR REPLACE INTO admin_config (id, value) VALUES (1, ?)',
+      JSON.stringify(config),
+    );
   }
 
   // ==================== 跳过片头片尾配置 ====================
@@ -641,11 +727,12 @@ export class SqliteStorage implements IStorage {
     source: string,
     id: string,
   ): Promise<EpisodeSkipConfig | null> {
-    const row = this.db
-      .prepare(
-        'SELECT value FROM skip_configs WHERE username = ? AND source = ? AND id = ?',
-      )
-      .get(userName, source, id) as { value: string } | undefined;
+    const row = this.queryOne(
+      'SELECT value FROM skip_configs WHERE username = ? AND source = ? AND id = ?',
+      userName,
+      source,
+      id,
+    ) as { value: string } | undefined;
     return row ? (JSON.parse(row.value) as EpisodeSkipConfig) : null;
   }
 
@@ -655,11 +742,13 @@ export class SqliteStorage implements IStorage {
     id: string,
     config: EpisodeSkipConfig,
   ): Promise<void> {
-    this.db
-      .prepare(
-        'INSERT OR REPLACE INTO skip_configs (username, source, id, value) VALUES (?, ?, ?, ?)',
-      )
-      .run(userName, source, id, JSON.stringify(config));
+    this.run(
+      'INSERT OR REPLACE INTO skip_configs (username, source, id, value) VALUES (?, ?, ?, ?)',
+      userName,
+      source,
+      id,
+      JSON.stringify(config),
+    );
   }
 
   async deleteSkipConfig(
@@ -667,19 +756,21 @@ export class SqliteStorage implements IStorage {
     source: string,
     id: string,
   ): Promise<void> {
-    this.db
-      .prepare(
-        'DELETE FROM skip_configs WHERE username = ? AND source = ? AND id = ?',
-      )
-      .run(userName, source, id);
+    this.run(
+      'DELETE FROM skip_configs WHERE username = ? AND source = ? AND id = ?',
+      userName,
+      source,
+      id,
+    );
   }
 
   async getAllSkipConfigs(
     userName: string,
   ): Promise<Record<string, EpisodeSkipConfig>> {
-    const rows = this.db
-      .prepare('SELECT source, id, value FROM skip_configs WHERE username = ?')
-      .all(userName) as Array<{ source: string; id: string; value: string }>;
+    const rows = this.queryAll(
+      'SELECT source, id, value FROM skip_configs WHERE username = ?',
+      userName,
+    ) as Array<{ source: string; id: string; value: string }>;
     const result: Record<string, EpisodeSkipConfig> = {};
     for (const row of rows) {
       result[this.skipField(row.source, row.id)] = JSON.parse(
@@ -696,11 +787,12 @@ export class SqliteStorage implements IStorage {
     source: string,
     id: string,
   ): Promise<EpisodeSkipConfig | null> {
-    const row = this.db
-      .prepare(
-        'SELECT value FROM episode_skip_configs WHERE username = ? AND source = ? AND id = ?',
-      )
-      .get(userName, source, id) as { value: string } | undefined;
+    const row = this.queryOne(
+      'SELECT value FROM episode_skip_configs WHERE username = ? AND source = ? AND id = ?',
+      userName,
+      source,
+      id,
+    ) as { value: string } | undefined;
     return row ? (JSON.parse(row.value) as EpisodeSkipConfig) : null;
   }
 
@@ -710,11 +802,13 @@ export class SqliteStorage implements IStorage {
     id: string,
     config: EpisodeSkipConfig,
   ): Promise<void> {
-    this.db
-      .prepare(
-        'INSERT OR REPLACE INTO episode_skip_configs (username, source, id, value) VALUES (?, ?, ?, ?)',
-      )
-      .run(userName, source, id, JSON.stringify(config));
+    this.run(
+      'INSERT OR REPLACE INTO episode_skip_configs (username, source, id, value) VALUES (?, ?, ?, ?)',
+      userName,
+      source,
+      id,
+      JSON.stringify(config),
+    );
   }
 
   async deleteEpisodeSkipConfig(
@@ -722,21 +816,21 @@ export class SqliteStorage implements IStorage {
     source: string,
     id: string,
   ): Promise<void> {
-    this.db
-      .prepare(
-        'DELETE FROM episode_skip_configs WHERE username = ? AND source = ? AND id = ?',
-      )
-      .run(userName, source, id);
+    this.run(
+      'DELETE FROM episode_skip_configs WHERE username = ? AND source = ? AND id = ?',
+      userName,
+      source,
+      id,
+    );
   }
 
   async getAllEpisodeSkipConfigs(
     userName: string,
   ): Promise<Record<string, EpisodeSkipConfig>> {
-    const rows = this.db
-      .prepare(
-        'SELECT source, id, value FROM episode_skip_configs WHERE username = ?',
-      )
-      .all(userName) as Array<{ source: string; id: string; value: string }>;
+    const rows = this.queryAll(
+      'SELECT source, id, value FROM episode_skip_configs WHERE username = ?',
+      userName,
+    ) as Array<{ source: string; id: string; value: string }>;
     const result: Record<string, EpisodeSkipConfig> = {};
     for (const row of rows) {
       result[this.skipField(row.source, row.id)] = JSON.parse(
@@ -764,27 +858,28 @@ export class SqliteStorage implements IStorage {
       'emby_configs',
       'crash_logs',
     ];
-    this.db.exec('BEGIN');
+    this.exec('BEGIN');
     try {
       for (const table of tables) {
-        this.db.prepare(`DELETE FROM ${table}`).run();
+        this.db.run(`DELETE FROM ${table}`);
       }
-      this.db.exec('COMMIT');
+      this.exec('COMMIT');
     } catch (e) {
-      this.db.exec('ROLLBACK');
+      this.exec('ROLLBACK');
       throw e;
     }
+    this.saveToFile();
     console.log('[SQLite] 所有数据已清空');
   }
 
   // ==================== 通用缓存 ====================
 
   async getCache(key: string): Promise<any | null> {
-    const row = this.db
-      .prepare(
-        'SELECT value FROM cache WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)',
-      )
-      .get(key, Date.now()) as { value: string } | undefined;
+    const row = this.queryOne(
+      'SELECT value FROM cache WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)',
+      key,
+      Date.now(),
+    ) as { value: string } | undefined;
     if (!row) return null;
 
     try {
@@ -801,31 +896,31 @@ export class SqliteStorage implements IStorage {
   ): Promise<void> {
     const expiresAt =
       expireSeconds !== undefined ? Date.now() + expireSeconds * 1000 : null;
-    this.db
-      .prepare(
-        'INSERT OR REPLACE INTO cache (key, value, expires_at) VALUES (?, ?, ?)',
-      )
-      .run(key, JSON.stringify(data), expiresAt);
+    this.run(
+      'INSERT OR REPLACE INTO cache (key, value, expires_at) VALUES (?, ?, ?)',
+      key,
+      JSON.stringify(data),
+      expiresAt,
+    );
   }
 
   async deleteCache(key: string): Promise<void> {
-    this.db.prepare('DELETE FROM cache WHERE key = ?').run(key);
+    this.run('DELETE FROM cache WHERE key = ?', key);
   }
 
   async clearExpiredCache(prefix?: string): Promise<void> {
     const now = Date.now();
     if (prefix) {
-      this.db
-        .prepare(
-          'DELETE FROM cache WHERE key LIKE ? AND expires_at IS NOT NULL AND expires_at <= ?',
-        )
-        .run(`${prefix}%`, now);
+      this.run(
+        'DELETE FROM cache WHERE key LIKE ? AND expires_at IS NOT NULL AND expires_at <= ?',
+        `${prefix}%`,
+        now,
+      );
     } else {
-      this.db
-        .prepare(
-          'DELETE FROM cache WHERE expires_at IS NOT NULL AND expires_at <= ?',
-        )
-        .run(now);
+      this.run(
+        'DELETE FROM cache WHERE expires_at IS NOT NULL AND expires_at <= ?',
+        now,
+      );
     }
   }
 
@@ -973,9 +1068,10 @@ export class SqliteStorage implements IStorage {
       const values = Object.values(records);
 
       if (values.length === 0) {
-        const loginRow = this.db
-          .prepare('SELECT * FROM login_stats WHERE username = ?')
-          .get(userName) as any;
+        const loginRow = this.queryOne(
+          'SELECT * FROM login_stats WHERE username = ?',
+          userName,
+        ) as any;
         const loginStats = loginRow
           ? {
               loginCount: loginRow.login_count || 0,
@@ -1043,9 +1139,10 @@ export class SqliteStorage implements IStorage {
             )[0]
           : '';
 
-      const loginRow = this.db
-        .prepare('SELECT * FROM login_stats WHERE username = ?')
-        .get(userName) as any;
+      const loginRow = this.queryOne(
+        'SELECT * FROM login_stats WHERE username = ?',
+        userName,
+      ) as any;
       const loginStats = loginRow
         ? {
             loginCount: loginRow.login_count || 0,
@@ -1106,15 +1203,14 @@ export class SqliteStorage implements IStorage {
   async getContentStats(limit = 10): Promise<ContentStat[]> {
     try {
       // 使用 SQL 聚合分组，避免 json_extract 依赖
-      const grouped = this.db
-        .prepare(
-          `SELECT key, COUNT(*) as play_count, COUNT(DISTINCT username) as unique_users
-           FROM play_records
-           GROUP BY key
-           ORDER BY play_count DESC
-           LIMIT ?`,
-        )
-        .all(limit) as Array<{
+      const grouped = this.queryAll(
+        `SELECT key, COUNT(*) as play_count, COUNT(DISTINCT username) as unique_users
+         FROM play_records
+         GROUP BY key
+         ORDER BY play_count DESC
+         LIMIT ?`,
+        limit,
+      ) as Array<{
         key: string;
         play_count: number;
         unique_users: number;
@@ -1125,11 +1221,10 @@ export class SqliteStorage implements IStorage {
       // 批量获取记录详情
       const keys = grouped.map((r) => r.key);
       const placeholders = keys.map(() => '?').join(',');
-      const allRecords = this.db
-        .prepare(
-          `SELECT key, value FROM play_records WHERE key IN (${placeholders})`,
-        )
-        .all(...keys) as Array<{ key: string; value: string }>;
+      const allRecords = this.queryAll(
+        `SELECT key, value FROM play_records WHERE key IN (${placeholders})`,
+        ...keys,
+      ) as Array<{ key: string; value: string }>;
 
       // 按 key 分组
       const recordsByKey = new Map<string, string[]>();
@@ -1193,11 +1288,18 @@ export class SqliteStorage implements IStorage {
     userName: string,
     loginTime: number,
     isFirstLogin?: boolean,
-    loginMeta?: { ip?: string; location?: string; device?: string; browser?: string; os?: string }
+    loginMeta?: {
+      ip?: string;
+      location?: string;
+      device?: string;
+      browser?: string;
+      os?: string;
+    },
   ): Promise<void> {
-    const row = this.db
-      .prepare('SELECT * FROM login_stats WHERE username = ?')
-      .get(userName) as any;
+    const row = this.queryOne(
+      'SELECT * FROM login_stats WHERE username = ?',
+      userName,
+    ) as any;
     const stats = row || {
       login_count: 0,
       first_login_time: null,
@@ -1211,70 +1313,70 @@ export class SqliteStorage implements IStorage {
         ? loginTime
         : stats.first_login_time;
 
-    this.db
-      .prepare(
-        `INSERT OR REPLACE INTO login_stats
-         (username, login_count, first_login_time, last_login_time, last_login_date,
-          last_login_ip, last_login_location, last_login_device, last_login_browser, last_login_os)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        userName, loginCount, firstLoginTime, loginTime, loginTime,
-        loginMeta?.ip ?? (row?.last_login_ip ?? null),
-        loginMeta?.location ?? (row?.last_login_location ?? null),
-        loginMeta?.device ?? (row?.last_login_device ?? null),
-        loginMeta?.browser ?? (row?.last_login_browser ?? null),
-        loginMeta?.os ?? (row?.last_login_os ?? null),
-      );
+    this.run(
+      `INSERT OR REPLACE INTO login_stats
+       (username, login_count, first_login_time, last_login_time, last_login_date,
+        last_login_ip, last_login_location, last_login_device, last_login_browser, last_login_os)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      userName,
+      loginCount,
+      firstLoginTime,
+      loginTime,
+      loginTime,
+      loginMeta?.ip ?? (row?.last_login_ip ?? null),
+      loginMeta?.location ?? (row?.last_login_location ?? null),
+      loginMeta?.device ?? (row?.last_login_device ?? null),
+      loginMeta?.browser ?? (row?.last_login_browser ?? null),
+      loginMeta?.os ?? (row?.last_login_os ?? null),
+    );
   }
 
   // ==================== Emby 配置 ====================
 
   async getUserEmbyConfig(userName: string): Promise<any | null> {
-    const row = this.db
-      .prepare('SELECT value FROM emby_configs WHERE username = ?')
-      .get(userName) as { value: string } | undefined;
+    const row = this.queryOne(
+      'SELECT value FROM emby_configs WHERE username = ?',
+      userName,
+    ) as { value: string } | undefined;
     return row ? JSON.parse(row.value) : null;
   }
 
   async saveUserEmbyConfig(userName: string, config: any): Promise<void> {
-    this.db
-      .prepare(
-        'INSERT OR REPLACE INTO emby_configs (username, value) VALUES (?, ?)',
-      )
-      .run(userName, JSON.stringify(config));
+    this.run(
+      'INSERT OR REPLACE INTO emby_configs (username, value) VALUES (?, ?)',
+      userName,
+      JSON.stringify(config),
+    );
   }
 
   async deleteUserEmbyConfig(userName: string): Promise<void> {
-    this.db
-      .prepare('DELETE FROM emby_configs WHERE username = ?')
-      .run(userName);
+    this.run('DELETE FROM emby_configs WHERE username = ?', userName);
   }
 
   // ==================== 崩溃日志 ====================
 
   async saveCrashLog(crashLog: CrashLog): Promise<void> {
-    this.db
-      .prepare(
-        'INSERT OR REPLACE INTO crash_logs (timestamp, value, created_at) VALUES (?, ?, ?)',
-      )
-      .run(crashLog.timestamp, JSON.stringify(crashLog), Date.now());
+    this.run(
+      'INSERT OR REPLACE INTO crash_logs (timestamp, value, created_at) VALUES (?, ?, ?)',
+      crashLog.timestamp,
+      JSON.stringify(crashLog),
+      Date.now(),
+    );
   }
 
   async getCrashLogs(limit = 50): Promise<CrashLog[]> {
-    const rows = this.db
-      .prepare('SELECT value FROM crash_logs ORDER BY created_at DESC LIMIT ?')
-      .all(limit) as Array<{ value: string }>;
+    const rows = this.queryAll(
+      'SELECT value FROM crash_logs ORDER BY created_at DESC LIMIT ?',
+      limit,
+    ) as Array<{ value: string }>;
     return rows.map((r) => JSON.parse(r.value) as CrashLog);
   }
 
   async deleteCrashLog(timestamp: string): Promise<void> {
-    this.db
-      .prepare('DELETE FROM crash_logs WHERE timestamp = ?')
-      .run(timestamp);
+    this.run('DELETE FROM crash_logs WHERE timestamp = ?', timestamp);
   }
 
   async clearCrashLogs(): Promise<void> {
-    this.db.prepare('DELETE FROM crash_logs').run();
+    this.run('DELETE FROM crash_logs');
   }
 }
