@@ -51,18 +51,22 @@ class NativeSqliteAdapter implements DatabaseLike {
     this.db.exec(sql);
   }
 
-  prepare(sql: string): PreparedStatement {
-    const stmt = this.db.prepare(sql);
-    return {
-      get: (...params: unknown[]) =>
-        stmt.get(...params) as Record<string, unknown> | undefined,
-      all: (...params: unknown[]) =>
-        stmt.all(...params) as Record<string, unknown>[],
-      run: (...params: unknown[]) => {
-        stmt.run(...params);
-      },
-    };
-  }
+prepare(sql: string): PreparedStatement {
+  const stmt = this.db.prepare(sql);
+  return {
+    get: (...params: unknown[]) =>
+      stmt.get(
+        ...(params as import('node:sqlite').SQLInputValue[]),
+      ) as Record<string, unknown> | undefined,
+    all: (...params: unknown[]) =>
+      stmt.all(
+        ...(params as import('node:sqlite').SQLInputValue[]),
+      ) as Record<string, unknown>[],
+    run: (...params: unknown[]) => {
+      stmt.run(...(params as import('node:sqlite').SQLInputValue[]));
+    },
+  };
+}
 
   close(): void {
     this.db.close();
