@@ -210,7 +210,7 @@ function generateTrustedAuthCookie(request: NextRequest): NextResponse {
   return response;
 }
 
-export async function proxy(request: NextRequest) {
+export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
   // 处理 /adult/ 路径前缀，重写为实际 API 路径
@@ -396,7 +396,6 @@ function shouldSkipAuth(pathname: string): boolean {
     '/screenshot.png',
     '/api/telegram/', // Telegram API 端点
     '/api/cache/', // 缓存 API 端点（内部使用，无需认证）
-    '/api/client-log', // 客户端日志收集端点（无需认证）
   ];
 
   return skipPaths.some((path) => pathname.startsWith(path));
