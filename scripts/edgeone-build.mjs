@@ -62,117 +62,69 @@ const pageSkipPaths = JSON.stringify(skipPaths.filter(p => !p.startsWith('/api/'
 let savedProxyContent = null;
 let savedLayoutContent = null;
 
-function getRuntimeEnvLiteral() {
-  const env = {};
-  for (const key of runtimeEnvKeys) {
-    if (process.env[key] !== undefined) {
-      env[key] = process.env[key];
-    }
+// 构建前：在 generateMetadata() 中注入 SSR 认证检查
+// generateMetadata 中的 redirect() 在 RSC 协议层面处理
+// 配合客户端 guard script（注入到 <head>），用户不会看到内容闪现
+function injectGenerateMetadataAuthCheck() {
+  const layoutPath = join(process.cwd(), 'src', 'app', 'layout.tsx');
+  if (!existsSync(layoutPath)) return false;
+
+  let content = readFileSync(layoutPath, 'utf8');
+  const marker = '/* edgeone-metadata-auth-guard */';
+  if (content.includes(marker)) return true;
+
+  // 添加 imports
+  const importMarker = "import { cookies } from 'next/headers';";
+  if (!content.includes(importMarker)) return false;
+  if (!content.includes("import { redirect } from 'next/navigation';")) {
+    content = content.replace(
+      importMarker,
+      `${importMarker}\nimport { redirect } from 'next/navigation';`
+    );
   }
-  return JSON.stringify(env);
-}
-
-function replaceEnvLiterals(code, envLiteral) {
-  let output = '';
-  let cursor = 0;
-  let replaced = 0;
-  const needle = 'env: {';
-
-  while (true) {
-    const start = code.indexOf(needle, cursor);
-    if (start === -1) {
-      output += code.slice(cursor);
-      break;
-    }
-
-    let i = start + 'env: '.length;
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-
-    for (; i < code.length; i += 1) {
-      const char = code[i];
-
-      if (inString) {
-        if (escaped) {
-          escaped = false;
-        } else if (char === '\\') {
-          escaped = true;
-        } else if (char === '"') {
-          inString = false;
-        }
-        continue;
-      }
-
-      if (char === '"') {
-        inString = true;
-      } else if (char === '{') {
-        depth += 1;
-      } else if (char === '}') {
-        depth -= 1;
-        if (depth === 0) {
-          i += 1;
-          break;
-        }
-      }
-    }
-
-    if (depth !== 0) {
-      console.warn('[edgeone-build] Unable to replace an env literal: malformed object');
-      output += code.slice(cursor);
-      break;
-    }
-
-    output += code.slice(cursor, start) + `env: ${envLiteral}`;
-    cursor = i;
-    replaced += 1;
-  }
-
-  if (replaced > 0) {
-    console.log(`[edgeone-build] Replaced ${replaced} generated env literal(s) with filtered runtime env`);
-  }
-
-  return output;
-}
-
-function patchEdgeFunctionEnvInjection() {
-  const edgeFunctionPath = join(process.cwd(), '.edgeone', 'edge-functions', 'index.js');
-  let code;
-  try {
-    code = readFileSync(edgeFunctionPath, 'utf8');
-  } catch {
-    return;
-  }
-
-  const marker = '/* edgeone-process-env-injected */';
-  const envLiteral = getRuntimeEnvLiteral();
-
-  code = replaceEnvLiterals(code, envLiteral);
-
-  const target = 'let request = context.request;';
-  if (!code.includes(marker) && !code.includes(target)) {
-    console.warn('[edgeone-build] Unable to patch edge function env injection: target not found');
-  } else if (!code.includes(marker)) {
-    code = code.replace(
-      target,
-      `${target}\n          ${marker}\n          if (typeof globalThis !== 'undefined' && globalThis.process?.env && context?.env) {\n            Object.assign(globalThis.process.env, context.env);\n          }`
+  if (!content.includes("import { headers } from 'next/headers';")) {
+    content = content.replace(
+      importMarker,
+      `${importMarker}\nimport { headers } from 'next/headers';`
     );
   }
 
-  // 兼容 Next.js 16 proxy.ts（executeMiddleware，构建时已临时转换）
-  const middlewareSignature = 'async function executeMiddleware({request}) {';
-  const middlewareMarker = '/* edgeone-middleware-env-injected */';
-  if (!code.includes(middlewareMarker) && !code.includes(middlewareSignature)) {
-    console.warn('[edgeone-build] Unable to patch middleware env injection: target not found');
-  } else if (!code.includes(middlewareMarker)) {
-    code = code.replace(
-      middlewareSignature,
-      `async function executeMiddleware({request, env}) {\n  ${middlewareMarker}\n  if (typeof globalThis !== 'undefined' && globalThis.process?.env && env) {\n    Object.assign(globalThis.process.env, env);\n  }`
-    );
-  }
+  // 定位 generateMetadata 函数内的 await cookies()
+  const genMetaMarker = 'export async function generateMetadata';
+  const genMetaIdx = content.indexOf(genMetaMarker);
+  if (genMetaIdx === -1) return false;
 
-  writeFileSync(edgeFunctionPath, code);
-  console.log('[edgeone-build] Patched edge function process.env injection');
+  const cookiesCall = 'await cookies();';
+  const idx = content.indexOf(cookiesCall, genMetaIdx);
+  if (idx === -1) return false;
+
+  const authCheck = `
+  ${marker}
+  // EdgeOne SSR auth guard (in generateMetadata)
+  const __gmH = await headers();
+  let __gmPath = __gmH.get('x-pathname') || __gmH.get('x-invoke-path') || '';
+  if (!__gmPath) {
+    const __gmRef = __gmH.get('referer') || '';
+    try { if (__gmRef) __gmPath = new URL(__gmRef).pathname; } catch {}
+  }
+  if (!__gmPath) __gmPath = '/';
+  const __gmSkip = ${pageSkipPaths};
+  if (!__gmSkip.some((p) => __gmPath.startsWith(p))) {
+    const __gmCookies = await cookies();
+    if (!__gmCookies.get('user_auth') && !__gmCookies.get('auth')) {
+      const __gmSearch = __gmH.get('x-search') || '';
+      redirect('/login?redirect=' + encodeURIComponent(__gmPath + __gmSearch));
+    }
+  }
+`;
+
+  const insertPos = idx + cookiesCall.length;
+  content = content.slice(0, insertPos) + authCheck + content.slice(insertPos);
+
+  // 同步写入（后面 injectLayoutAuthCheck 会再次读取并覆盖）
+  writeFileSync(layoutPath, content);
+  console.log('[edgeone-build] Injected SSR auth guard into generateMetadata()');
+  return true;
 }
 
 // 构建前：将 proxy.ts 转换为 middleware.ts
@@ -229,10 +181,9 @@ function convertProxyToMiddlewareForBuild() {
   return true;
 }
 
-// 构建前：在 layout.tsx 的 RootLayout 函数体内注入服务端认证检查
-// EdgeOne 页面请求绕过 edge middleware，需要在 SSR 层（RootLayout）做认证
-// 注意：layout.tsx 有两处 await cookies()，第一处在 generateMetadata，第二处才在 RootLayout
-// 必须注入到 RootLayout 内的那处，否则 generateMetadata 会触发 redirect 导致整个 app 崩溃
+// 构建前：在 layout.tsx 注入客户端认证 guard
+// 这个 script 在 React 水合前同步执行，防止页面内容闪现
+// SSR auth check 由 injectGenerateMetadataAuthCheck() 在 generateMetadata() 中处理
 function injectLayoutAuthCheck() {
   const layoutPath = join(process.cwd(), 'src', 'app', 'layout.tsx');
   if (!existsSync(layoutPath)) {
@@ -246,59 +197,25 @@ function injectLayoutAuthCheck() {
   const marker = '/* edgeone-layout-auth-guard */';
   if (original.includes(marker)) return true;
 
-  // 添加 imports
-  const importMarker = "import { cookies } from 'next/headers';";
-  if (!original.includes(importMarker)) {
-    console.warn('[edgeone-build] Cannot find cookies import in layout.tsx');
-    return false;
-  }
-  let content = original.replace(
-    importMarker,
-    `${importMarker}\n${marker}\nimport { redirect } from 'next/navigation';\nimport { headers } from 'next/headers';`
-  );
+  let content = original;
 
-  // 找 RootLayout 函数体内的 await cookies()，不是第一个（generateMetadata 里的）
-  // 通过先定位 "export default async function RootLayout" 再在其后找 await cookies()
-  const rootLayoutMarker = 'export default async function RootLayout(';
-  const rootLayoutIdx = content.indexOf(rootLayoutMarker);
-  if (rootLayoutIdx === -1) {
-    console.warn('[edgeone-build] Cannot find RootLayout in layout.tsx');
-    return false;
+  // 注入客户端 guard script 到 <head> 最前面
+  // 在 React 水合前同步执行，用户看不到内容闪现
+  // 逻辑：
+  //   1. URL 有 redirect= 参数 → 跳过（防止循环）
+  //   2. 有 user_auth cookie → 跳过（已认证）
+  //   3. 路径在 skipPaths 中 → 跳过（公开页面）
+  //   4. 否则 → redirect 到 /login
+  const guardJs = `(function(){try{var u=window.location.pathname||'/';var s=window.location.search||'';if(s.indexOf('redirect=')!==-1)return;if(document.cookie.indexOf('user_auth=')!==-1)return;var sk=${pageSkipPaths};for(var j=0;j<sk.length;j++){if(u.startsWith(sk[j]))return;}window.location.replace('/login?redirect='+encodeURIComponent(u+s));}catch(e){}})()`;
+  const guardScript = `<script dangerouslySetInnerHTML={{ __html: ${JSON.stringify(guardJs)} }} />`;
+  const headIdx = content.indexOf('<head>');
+  if (headIdx !== -1) {
+    const headInsertPos = headIdx + '<head>'.length;
+    content = content.slice(0, headInsertPos) + guardScript + content.slice(headInsertPos);
   }
-
-  const cookiesCall = 'await cookies();';
-  const idx = content.indexOf(cookiesCall, rootLayoutIdx);
-  if (idx === -1) {
-    console.warn('[edgeone-build] Cannot find "await cookies()" in RootLayout');
-    return false;
-  }
-
-  const authCheck = `
-  // EdgeOne SSR auth guard
-  const __h = await headers();
-  let __path = __h.get('x-pathname') || __h.get('x-invoke-path') || '';
-  if (!__path) {
-    const __ref = __h.get('referer') || '';
-    try { if (__ref) __path = new URL(__ref).pathname; } catch {}
-  }
-  if (!__path) __path = '/';
-
-  const __skipPaths = ${pageSkipPaths};
-  if (!__skipPaths.some((p) => __path.startsWith(p))) {
-    const __cookieStore = await cookies();
-    const __authCookie = __cookieStore.get('user_auth') || __cookieStore.get('auth');
-    if (!__authCookie) {
-      const __search = __h.get('x-search') || '';
-      redirect('/login?redirect=' + encodeURIComponent(__path + __search));
-    }
-  }
-`;
-
-  const insertPos = idx + cookiesCall.length;
-  content = content.slice(0, insertPos) + authCheck + content.slice(insertPos);
 
   writeFileSync(layoutPath, content);
-  console.log('[edgeone-build] Injected SSR auth check into RootLayout in layout.tsx');
+  console.log('[edgeone-build] Injected client auth guard into layout.tsx <head>');
   return true;
 }
 
@@ -333,6 +250,8 @@ function restoreLayoutAfterBuild() {
 
 // 构建前准备
 const wasConverted = convertProxyToMiddlewareForBuild();
+// 客户端 guard script（<head> 中）已足够处理认证 redirect
+// 不在 generateMetadata 中注入 SSR auth check，避免 F12 禁用缓存时的额外刷新
 injectLayoutAuthCheck();
 
 // 确保异常退出时也能清理
@@ -343,7 +262,6 @@ process.on('exit', () => {
 
 // 执行构建
 const isInsideEdgeOneBuilder = process.env.NEXT_PRIVATE_STANDALONE === 'true';
-
 const command = isInsideEdgeOneBuilder
   ? 'BUILD_TARGET=edgeone EDGEONE_PAGES=1 pnpm build'
   : 'BUILD_TARGET=edgeone EDGEONE_PAGES=1 edgeone makers build';
@@ -359,9 +277,6 @@ child.on('exit', (code, signal) => {
     for (const file of ['edgeone.json', 'package.json']) {
       copyFileSync(join(process.cwd(), file), join(process.cwd(), '.edgeone', file));
     }
-
-    patchEdgeFunctionEnvInjection();
-
     // 清理可能残留的 .env 文件
     for (const envPath of [
       join(process.cwd(), '.edgeone', '.env'),
