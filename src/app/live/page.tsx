@@ -1,23 +1,14 @@
-/* eslint-disable @typescript-eslint/ban-ts-comment, @typescript-eslint/no-explicit-any, react-hooks/exhaustive-deps, no-console, @next/next/no-img-element */
+/* eslint-disable react-hooks/exhaustive-deps, no-console, @next/next/no-img-element */
 
 'use client';
 
+import { Box, Tab, Tabs } from '@mui/material';
+import Hls from 'hls.js';
+import { ChevronDown, ChevronUp, Heart, Menu, Radio, RefreshCw, Search, Tv, X } from 'lucide-react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
 
-import Hls from 'hls.js';
-import { Heart, Menu, Radio, RefreshCw, Search, Tv, X, ChevronDown, ChevronUp } from 'lucide-react';
-import { useRouter, useSearchParams } from 'next/navigation';
-import { Tabs, Tab, Box } from '@mui/material';
-
-import {
-  debounce,
-} from '@/lib/channel-search';
-import {
-  isMobile,
-  isTablet,
-  isSafari,
-  devicePerformance
-} from '@/lib/utils';
+import { debounce } from '@/lib/channel-search';
 import {
   deleteFavorite,
   generateStorageKey,
@@ -25,13 +16,15 @@ import {
   saveFavorite,
   subscribeToDataUpdates,
 } from '@/lib/db.client';
+import OptimizedHlsLoader from '@/lib/hls-loader';
 import { parseCustomTimeFormat } from '@/lib/time';
+import { devicePerformance, isMobile, isSafari } from '@/lib/utils';
+import { useInView } from '@/hooks/useInView';
+import { useLiveSync } from '@/hooks/useLiveSync';
+import { useTabsDragScroll } from '@/hooks/useTabsDragScroll';
 
 import EpgScrollableRow from '@/components/EpgScrollableRow';
 import PageLayout from '@/components/PageLayout';
-import { useLiveSync } from '@/hooks/useLiveSync';
-import { useTabsDragScroll } from '@/hooks/useTabsDragScroll';
-import { useInView } from '@/hooks/useInView';
 
 // 扩展 HTMLVideoElement 类型以支持 hls 和 flv 属性
 declare global {
@@ -1644,44 +1637,6 @@ function LivePageClient() {
     }
   }, [selectedGroup, groupedChannels]);
 
-  class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
-    constructor(config: any) {
-      super(config);
-      const load = this.load.bind(this);
-      this.load = function (context: any, config: any, callbacks: any) {
-        // 所有的请求都带一个 source 参数
-        try {
-          const url = new URL(context.url);
-          url.searchParams.set('moontv-source', currentSourceRef.current?.key || '');
-          context.url = url.toString();
-        } catch (error) {
-          // ignore
-        }
-        // 拦截manifest和level请求
-        if (
-          (context as any).type === 'manifest' ||
-          (context as any).type === 'level'
-        ) {
-          // 判断是否浏览器直连
-          const isLiveDirectConnectStr = localStorage.getItem('liveDirectConnect');
-          const isLiveDirectConnect = isLiveDirectConnectStr === 'true';
-          if (isLiveDirectConnect) {
-            // 浏览器直连，使用 URL 对象处理参数
-            try {
-              const url = new URL(context.url);
-              url.searchParams.set('allowCORS', 'true');
-              context.url = url.toString();
-            } catch (error) {
-              // 如果 URL 解析失败，回退到字符串拼接
-              context.url = context.url + '&allowCORS=true';
-            }
-          }
-        }
-        // 执行原始load方法
-        load(context, config, callbacks);
-      };
-    }
-  }
 
   // 错误重试状态管理
   let keyLoadErrorCount = 0;
@@ -1716,10 +1671,14 @@ function LivePageClient() {
     // 基于最新 hls.js 源码和设备性能的智能配置
     const hlsConfig = {
       debug: false,
-      
+
       // Worker 配置 - 根据设备性能和浏览器能力
       enableWorker: !isMobile && !isSafari && devicePerformance !== 'low',
-      
+
+      // iOS 17.1+ 优先使用 ManagedMediaSource 以获得更稳定的 MSE 体验
+      // 参考：https://developer.mozilla.org/en-US/docs/Web/API/ManagedMediaSource
+      preferManagedMediaSource: true,
+
       // 低延迟模式 - 仅在高性能非移动设备上启用 (源码默认为true)
       lowLatencyMode: !isMobile && devicePerformance === 'high',
       
@@ -1781,8 +1740,18 @@ function LivePageClient() {
           }
         }
       }),
-      
-      loader: CustomHlsJsLoader,
+
+      /* HLS Loader：直连模式 + 源标识（基于 hls.js 顺序加载设计） */
+      loader: class extends OptimizedHlsLoader {
+        constructor(config: any) {
+          super({
+            ...config,
+            filterAds: false,
+            enableDirectConnect: localStorage.getItem('liveDirectConnect') === 'true',
+            sourceKey: currentSourceRef.current?.key || '',
+          });
+        }
+      },
     };
 
     const hls = new Hls(hlsConfig);
@@ -1974,11 +1943,11 @@ function LivePageClient() {
     });
   }
 
-  // FLV 播放器加载函数
+  // FLV 播放器加载函数（使用 mpegts.js）
   function flvLoader(video: HTMLVideoElement, url: string, art: any) {
-    const flvjs = (window as any).DynamicFlvjs;
-    if (!flvjs || !flvjs.isSupported()) {
-      console.error('flv.js 不支持当前浏览器');
+    const mpegts = (window as any).DynamicMpegts;
+    if (!mpegts || !mpegts.isSupported()) {
+      console.error('mpegts.js 不支持当前浏览器');
       return;
     }
 
@@ -1994,7 +1963,7 @@ function LivePageClient() {
       }
     }
 
-    const flvPlayer = flvjs.createPlayer({
+    const flvPlayer = mpegts.createPlayer({
       type: 'flv',
       url: url,
       isLive: true,
@@ -2023,9 +1992,9 @@ function LivePageClient() {
     flvPlayer.load();
     video.flv = flvPlayer;
 
-    flvPlayer.on(flvjs.Events.ERROR, (errorType: string, errorDetail: string) => {
+    flvPlayer.on(mpegts.Events.ERROR, (errorType: string, errorDetail: string) => {
       console.error('FLV Error:', errorType, errorDetail);
-      if (errorType === flvjs.ErrorTypes.NETWORK_ERROR) {
+      if (errorType === mpegts.ErrorTypes.NETWORK_ERROR) {
         flvNetworkRetryCount++;
         console.log(`FLV 网络错误 (${flvNetworkRetryCount}/${MAX_FLV_NETWORK_RETRIES})，尝试重新加载...`);
 
@@ -2051,7 +2020,7 @@ function LivePageClient() {
             console.warn('FLV 重新加载失败:', e);
           }
         }, 2000 * flvNetworkRetryCount);
-      } else if (errorType === flvjs.ErrorTypes.MEDIA_ERROR) {
+      } else if (errorType === mpegts.ErrorTypes.MEDIA_ERROR) {
         console.error('FLV 媒体错误:', errorDetail);
         setUnsupportedType('media-error');
         setIsVideoLoading(false);
@@ -2273,21 +2242,21 @@ function LivePageClient() {
       }
     }; // 结束 initPlayer 函数
 
-    // 动态导入 ArtPlayer 和 flv.js 并初始化
+    // 动态导入 ArtPlayer 和 mpegts.js 并初始化
     const loadAndInit = async () => {
       try {
         const { default: Artplayer } = await import('artplayer');
 
-        // 动态导入 flv.js（避免 SSR 问题）
-        const flvjs = await import('flv.js');
+        // 动态导入 mpegts.js（避免 SSR 问题）
+        const mpegts = await import('mpegts.js');
 
         // 将导入的模块设置为全局变量供 initPlayer 使用
         (window as any).DynamicArtplayer = Artplayer;
-        (window as any).DynamicFlvjs = flvjs.default;
+        (window as any).DynamicMpegts = mpegts.default;
 
         await initPlayer();
       } catch (error) {
-        console.error('动态导入 ArtPlayer 或 flv.js 失败:', error);
+        console.error('动态导入 ArtPlayer 或 mpegts.js 失败:', error);
         // 不设置错误，只记录日志
       }
     };
